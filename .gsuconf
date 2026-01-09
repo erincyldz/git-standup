@@ -1,0 +1,10 @@
+# .gsuconf — configuration for git-standup
+# Lines starting with # are comments.
+# Use `exclude=` or a leading `-` to exclude projects.
+# Use `include=` or a leading `+` to include projects.
+# This file excludes the current project directory from scans.
+# Example usages:
+# include=/path/to/your/project
+# exclude=/path/to/your/project
+# +/path/to/your/project
+# -/path/to/your/project

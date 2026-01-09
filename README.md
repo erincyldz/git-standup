@@ -55,6 +55,7 @@ git standup [-a <author name>]
             [-r]
             [-c]
             [-R]
+            [-i]
 ```
 
 Here is the detail for each of the options
@@ -78,6 +79,7 @@ Here is the detail for each of the options
 | s | Silences the no activity message (useful when running in a directory having many repositories) |
 | c | Show diff-stat for every matched commit
 | r | Generates the standup report file `git-standup-report.txt` in the current directory |
+| i | Ignore the local `.gsuconf` configuration file (do not apply includes/excludes) |
 | R | Display the author date instead of the committer date |
 
 For the basic usage, all you have to do is run `git standup` in a repository or a folder containing multiple repositories
@@ -220,6 +222,26 @@ And you want the `git-standup` to show logs for only `project-a` and `project-b`
 project-a
 project-b
 ```
+
+## Local configuration (`.gsuconf`)
+
+You can specify projects to explicitly include or exclude by creating a `.gsuconf` file in the directory where you run `git-standup`.
+
+- `include=/path/to/project` or `+relative/path` — include a project
+- `exclude=/path/to/project` or `-relative/path` — exclude a project
+- Lines starting with `#` are comments; whitespace is trimmed and empty entries are ignored
+
+If the same path (after normalization) appears in both include and exclude, `git-standup` will print a warning and **exclude takes precedence**.
+
+Example:
+
+```
++projects/frontend
+exclude=/home/me/projects/old-repo
+# Comment
+```
+
+You can disable reading `.gsuconf` with `git standup -i`.
 
 ## Changing the Weekdays
 

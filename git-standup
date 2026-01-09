@@ -25,6 +25,7 @@ Usage:
   -A      - List commits after this date
   -B      - List commits before this date
   -R      - Display the author date instead of the committer date
+  -i      - Ignore the local .gsuconf configuration file (do not apply includes/excludes)
 
 Examples:
   git standup -a "John Doe" -w "MON-FRI" -m 3
@@ -124,9 +125,9 @@ function runStandup() {
   fi
 }
 
-while getopts "hgfsd:u:a:w:m:D:A:B:LrcRFb:" opt; do
+while getopts "higfsd:u:a:w:m:D:A:B:LrcRFb:" opt; do
   case $opt in
-    h | d | u | a | w | m | g | D | f | s | L | r | A | B | c | R | F | b)
+    h | i | d | u | a | w | m | g | D | f | s | L | r | A | B | c | R | F | b)
       declare "option_$opt=${OPTARG:-0}"
       ;;
     \?)
@@ -170,9 +171,95 @@ RAN_FROM_DIR=$(pwd)
 REPORT_FILE_PATH="${RAN_FROM_DIR}/git-standup-report.txt"
 STAT=
 
+# Portable absolute path resolver
+abspath() {
+  if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    readlink -f "$1"
+  elif command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
+  else
+  
+    if [ -d "$1" ]; then
+      (cd "$1" 2>/dev/null && pwd -P) || echo ""
+    else
+      dir=$(dirname -- "$1")
+      base=$(basename -- "$1")
+      if (cd "$dir" 2>/dev/null && printf '%s\n' "$(pwd -P)/$base"); then
+        :
+      else
+        echo ""
+      fi
+    fi
+  fi
+}
+
 # If report is to be generated, remove the existing report file if any
 if [[ -n $option_r ]]; then
   rm -rf "${REPORT_FILE_PATH}"
+fi
+
+# Parse .gsuconf in the current directory (optional)
+# Format supported (per line):
+#   include=/path/to/project    or  +relative/path
+#   exclude=/path/to/project    or  -relative/path
+# Lines starting with # are comments.
+GSU_CONF_FILE="${RAN_FROM_DIR}/.gsuconf"
+GSU_INCLUDES=()
+GSU_EXCLUDES=()
+
+# If -i flag is provided, ignore the local .gsuconf entirely
+if [[ ${option_i:=} ]]; then
+  if [[ -f "$GSU_CONF_FILE" ]]; then
+    echo "Ignoring $(basename "$GSU_CONF_FILE") due to -i flag" >&2
+  fi
+else
+  if [[ -f "$GSU_CONF_FILE" ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      # ignore comments (lines starting with #)
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      # trim leading/trailing whitespace (spaces, tabs, etc.)
+      line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == include=* ]]; then
+        val="${line#include=}"
+        [[ -n "$val" ]] && GSU_INCLUDES+=("$val")
+        continue
+      fi
+      if [[ "$line" == exclude=* ]]; then
+        val="${line#exclude=}"
+        [[ -n "$val" ]] && GSU_EXCLUDES+=("$val")
+        continue
+      fi
+      case "$line" in
+        +*) val="${line#+}"; [[ -n "$val" ]] && GSU_INCLUDES+=("$val") ;;
+        -*) val="${line#-}"; [[ -n "$val" ]] && GSU_EXCLUDES+=("$val") ;;
+        *) ;;
+      esac
+    done < "$GSU_CONF_FILE"
+  fi
+fi
+
+# Check for include/exclude conflicts: normalize entries and warn if the same path
+if [[ ${#GSU_INCLUDES[@]} -gt 0 && ${#GSU_EXCLUDES[@]} -gt 0 ]]; then
+  declare -a new_includes=()
+  for inc in "${GSU_INCLUDES[@]}"; do
+    [[ "$inc" = /* ]] || inc="${RAN_FROM_DIR%/}/$inc"
+    inc="${inc%/.git}"
+    inc_abs=$(abspath "$inc" 2>/dev/null || echo "")
+    conflict=0
+    for excl in "${GSU_EXCLUDES[@]}"; do
+      [[ "$excl" = /* ]] || excl="${RAN_FROM_DIR%/}/$excl"
+      excl="${excl%/.git}"
+      excl_abs=$(abspath "$excl" 2>/dev/null || echo "")
+      if [[ -n "$inc_abs" && -n "$excl_abs" && "$inc_abs" == "$excl_abs" ]]; then
+        echo "${YELLOW}Warning: '$inc_abs' is present in both include and exclude; exclude will take precedence${NORMAL}" >&2
+        conflict=1
+        break
+      fi
+    done
+    [[ $conflict -eq 0 ]] && new_includes+=("$inc")
+  done
+  GSU_INCLUDES=("${new_includes[@]}")
 fi
 
 if [[ ${option_m:=} ]]; then
@@ -220,26 +307,95 @@ fi
 GIT_DATE_FORMAT=${option_D:-relative}
 
 # For when the command has been run in a non-repo directory
+declare -a PROJECT_DIRS_ARRAY
 if [[ ${option_F:=} || ! -d ".git" || -f ".git" ]]; then
   BASE_DIR=$(pwd)
   # Set delimiter to newline for the loop
   IFS=$'\n'
 
   if [[ -f ".git-standup-whitelist" ]]; then
-    SEARCH_PATH=$(cat .git-standup-whitelist)
+    mapfile -t SEARCH_ARRAY < .git-standup-whitelist
   else
-    SEARCH_PATH=.
+    SEARCH_ARRAY=(.)
   fi
 
   # Recursively search for git repositories
-  PROJECT_DIRS=$(find ${INCLUDE_LINKS} ${SEARCH_PATH} -maxdepth ${MAXDEPTH} -mindepth 0 -name .git)
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] && PROJECT_DIRS_ARRAY+=("$dir")
+  done < <(find ${INCLUDE_LINKS} "${SEARCH_ARRAY[@]}" -maxdepth "${MAXDEPTH}" -mindepth 0 -name .git 2>/dev/null)
 elif [[ -f ".git" || -d ".git" ]]; then
-  PROJECT_DIRS=("$(pwd)/.git")
+  PROJECT_DIRS_ARRAY=("$(pwd)/.git")
 fi
 
-# if project directories is still empty
+# If .gsuconf provided includes, add them to the project list
+if [[ -n ${GSU_INCLUDES[@]} ]]; then
+  # Add includes (make paths absolute relative to RAN_FROM_DIR)
+  for inc in "${GSU_INCLUDES[@]}"; do
+    [[ "$inc" = /* ]] || inc="${RAN_FROM_DIR%/}/$inc"
+    # strip trailing /.git if present
+    inc="${inc%/.git}"
+    inc_abs=$(abspath "$inc" 2>/dev/null || echo "")
+    if [[ -n "$inc_abs" && -d "$inc_abs/.git" ]]; then
+      PROJECT_DIRS_ARRAY+=("${inc_abs%/}/.git")
+    elif [[ -n "$inc_abs" && -d "$inc_abs" && -f "$inc_abs/HEAD" ]]; then
+      # probably a bare repository
+      PROJECT_DIRS_ARRAY+=("${inc_abs%/}")
+    fi
+  done
+fi
+
+# Filter excludes from PROJECT_DIRS_ARRAY
+if [[ -n ${GSU_EXCLUDES[@]} ]]; then
+  declare -a filtered_array
+  for pdir in "${PROJECT_DIRS_ARRAY[@]}"; do
+    if [[ "$pdir" = */.git ]]; then
+      proj=$(abspath "$(dirname "$pdir")")
+    else
+      proj=$(abspath "$pdir")
+    fi
+    skip=0
+    for excl in "${GSU_EXCLUDES[@]}"; do
+      [[ "$excl" = /* ]] || excl="${RAN_FROM_DIR%/}/$excl"
+      excl="${excl%/.git}"
+      excl_abs=$(abspath "$excl" 2>/dev/null)
+      if [[ -z "$excl_abs" ]]; then
+        echo "${YELLOW}Warning: exclude path '$excl' does not exist or could not be resolved${NORMAL}" >&2
+        continue
+      fi
+      if [[ "$proj" == "$excl_abs" || "$proj" == "$excl_abs/"* ]]; then
+        skip=1
+        break
+      fi
+    done
+    [[ $skip -eq 0 ]] && filtered_array+=("$pdir")
+  done
+  PROJECT_DIRS_ARRAY=("${filtered_array[@]}")
+fi
+
+# Deduplicate projects by canonical project root (always run)
+declare -A final_seen=()
+declare -a final_dirs=()
+for pdir in "${PROJECT_DIRS_ARRAY[@]}"; do
+  if [[ "$pdir" = */.git ]]; then
+    root=$(abspath "$(dirname "$pdir")")
+  else
+    root=$(abspath "$pdir")
+  fi
+  if [[ -z "${final_seen[$root]}" ]]; then
+    final_seen[$root]=1
+    if [[ -d "$root/.git" ]]; then
+      final_dirs+=("${root%/}/.git")
+    else
+      final_dirs+=("$root")
+    fi
+  fi
+done
+
+PROJECT_DIRS_ARRAY=("${final_dirs[@]}")
+
+# if project directories is still empty and no .gsuconf was used
 # we might be sitting inside a git repo
-if [[ -z ${PROJECT_DIRS} ]]; then
+if [[ ${#PROJECT_DIRS_ARRAY[@]} -eq 0 && ${#GSU_INCLUDES[@]} -eq 0 && ${#GSU_EXCLUDES[@]} -eq 0 ]]; then
   ROOT_DIR_COMMAND="git rev-parse --show-toplevel"
   PROJECT_ROOT=$(eval "${ROOT_DIR_COMMAND}" 2> /dev/null)
 
@@ -248,19 +404,22 @@ if [[ -z ${PROJECT_DIRS} ]]; then
     exit 0
   fi
 
-  PROJECT_DIRS=("${PROJECT_ROOT}/.git")
+  PROJECT_DIRS_ARRAY=("${PROJECT_ROOT}/.git")
 fi
 
 # Foreach of the project directories, run the standup
-IFS=$'\n'
-for DIR in ${PROJECT_DIRS}; do
-  PROJECT_DIR=$(dirname "$DIR")
+for DIR in "${PROJECT_DIRS_ARRAY[@]}"; do
+  if [[ "$DIR" = */.git ]]; then
+    PROJECT_DIR=$(dirname "$DIR")
+  else
+    PROJECT_DIR="$DIR"
+  fi
   cd "$PROJECT_DIR" || exit
   CUR_DIR=$(pwd)
   BASENAME=$(basename "$CUR_DIR")
 
   # continue if not a git directory
-  if [[ ! -d ".git" || -f ".git" ]]; then
+  if [[ ! -d ".git" && ! -f ".git" ]]; then
     cd "${BASE_DIR}" || exit
     continue
   fi
